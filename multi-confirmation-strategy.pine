@@ -1,0 +1,234 @@
+//@version=6
+strategy("Multi-Confirmation Strategy", overlay=true, initial_capital=1000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, currency=currency.USD, pyramiding=0, calc_on_every_tick=false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Trend & Momentum
+emaLength = input.int(50, "EMA Length", minval=1)
+rsiLength = input.int(14, "RSI Length", minval=1)
+rsiOversold = input.int(35, "RSI Oversold Zone", minval=1, maxval=50)
+rsiOverbought = input.int(65, "RSI Overbought Zone", minval=50, maxval=100)
+
+// MACD
+macdFast = input.int(12, "MACD Fast")
+macdSlow = input.int(26, "MACD Slow")
+macdSignal = input.int(9, "MACD Signal")
+
+// ATR & Risk
+atrLength = input.int(14, "ATR Length")
+atrMultiplier = input.float(1.5, "ATR Multiplier for SL", step=0.1)
+riskPerTrade = input.float(15.0, "Max Risk Per Trade ($)", step=1)
+
+// RR Settings
+minRR = input.float(1.5, "Minimum Risk:Reward", step=0.1)
+tp1RR = input.float(1.5, "TP1 Risk:Reward", step=0.1)
+tp1Percent = input.int(50, "TP1 Close %", minval=10, maxval=100)
+tp2RR = input.float(2.0, "TP2 Risk:Reward", step=0.1)
+
+// Swing Detection
+swingLookback = input.int(10, "Swing Lookback Bars")
+
+// Volume Filter
+useVolumeFilter = input.bool(true, "Use Volume Filter")
+volumeLength = input.int(20, "Volume MA Length")
+volumeMultiplier = input.float(1.2, "Volume Multiplier", step=0.1)
+
+// News Filter
+useNewsFilter = input.bool(true, "Filter High-Impact News")
+newsBufferMinutes = input.int(20, "News Buffer (minutes)")
+
+// Time Filter
+startHour = input.int(0, "Start Hour (UTC)")
+endHour = input.int(24, "End Hour (UTC)")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INDICATORS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+ema50 = ta.ema(close, emaLength)
+rsi = ta.rsi(close, rsiLength)
+[macdLine, signalLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSignal)
+atr = ta.atr(atrLength)
+volMA = ta.sma(volume, volumeLength)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SWING DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+swingHigh = ta.pivothigh(high, swingLookback, swingLookback)
+swingLow = ta.pivotlow(low, swingLookback, swingLookback)
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+
+if not na(swingLow)
+    lastSwingLow := swingLow
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEWS FILTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+isNewsTime() =>
+    hour_utc = hour(time, "UTC")
+    minute_utc = minute(time, "UTC")
+    day_utc = dayofweek(time, "UTC")
+    dom = dayofmonth(time)
+    
+    isCPI = (dom >= 10 and dom <= 13) and hour_utc == 13 and minute_utc >= 15 and minute_utc <= 45
+    isFOMC = hour_utc == 19 and minute_utc >= 0 and minute_utc <= 30
+    isNFP = day_utc == dayofweek.friday and dom <= 7 and hour_utc == 13 and minute_utc >= 15 and minute_utc <= 45
+    
+    isCPI or isFOMC or isNFP
+
+newsBlocked = useNewsFilter and isNewsTime()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TIME FILTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+currentHour = hour(time, "UTC")
+timeAllowed = currentHour >= startHour and currentHour < endHour
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VOLUME FILTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+volumeOK = useVolumeFilter ? volume > (volMA * volumeMultiplier) : true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bullishTrend = close > ema50
+bearishTrend = close < ema50
+
+rsiLongCondition = rsi > rsiOversold and rsi < 50 and rsi > rsi[1]
+rsiShortCondition = rsi < rsiOverbought and rsi > 50 and rsi < rsi[1]
+
+macdLongCondition = histLine > 0 and histLine > histLine[1]
+macdShortCondition = histLine < 0 and histLine < histLine[1]
+
+structureLong = close > lastSwingLow
+structureShort = close < lastSwingHigh
+
+longCondition = bullishTrend and rsiLongCondition and macdLongCondition and volumeOK and structureLong
+shortCondition = bearishTrend and rsiShortCondition and macdShortCondition and volumeOK and structureShort
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALCULATE SL & TP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float entryPrice = na
+var float stopLoss = na
+var float takeProfit1 = na
+var float takeProfit2 = na
+var float riskAmount = na
+var float calculatedRR = na
+
+var label longLabel = na
+var label shortLabel = na
+
+if longCondition and not newsBlocked and timeAllowed and strategy.position_size == 0
+    swingSL = na(lastSwingLow) ? low - (atr * atrMultiplier) : lastSwingLow - (atr * atrMultiplier * 0.5)
+    sl = math.min(swingSL, close - (atr * atrMultiplier))
+    
+    riskPerShare = close - sl
+    tp1 = close + (riskPerShare * tp1RR)
+    tp2 = close + (riskPerShare * tp2RR)
+    rr = (tp1 - close) / riskPerShare
+    
+    entryPrice := close
+    stopLoss := sl
+    takeProfit1 := tp1
+    takeProfit2 := tp2
+    riskAmount := riskPerShare
+    calculatedRR := rr
+    
+    if rr >= minRR
+        strategy.entry("Long", strategy.long)
+        strategy.exit("TP1 Long", "Long", qty_percent=tp1Percent, limit=tp1, stop=sl)
+        strategy.exit("TP2 Long", "Long", limit=tp2, stop=sl)
+        
+        longLabel := label.new(bar_index, low, text="LONG", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.large)
+        label.new(bar_index, low - atr, text="Entry: " + str.tostring(close, "#.##") + "\nSL: " + str.tostring(sl, "#.##") + "\nTP1: " + str.tostring(tp1, "#.##") + "\nTP2: " + str.tostring(tp2, "#.##"), style=label.style_label_up, color=color.new(color.teal, 20), textcolor=color.white, size=size.small)
+        
+        alert("LONG SIGNAL - " + syminfo.tickerid + "\nEntry: " + str.tostring(close, "#.##") + "\nSL: " + str.tostring(sl, "#.##") + "\nTP1: " + str.tostring(tp1, "#.##") + " (1:" + str.tostring(tp1RR, "#.#") + " RR)" + "\nTP2: " + str.tostring(tp2, "#.##") + " (1:" + str.tostring(tp2RR, "#.#") + " RR)" + "\nRR: 1:" + str.tostring(rr, "#.##") + "\nTime: " + str.tostring(hour(time, "UTC"), "00") + ":" + str.tostring(minute(time, "UTC"), "00") + " UTC", alert.freq_once_per_bar_close)
+
+if shortCondition and not newsBlocked and timeAllowed and strategy.position_size == 0
+    swingSL = na(lastSwingHigh) ? high + (atr * atrMultiplier) : lastSwingHigh + (atr * atrMultiplier * 0.5)
+    sl = math.max(swingSL, close + (atr * atrMultiplier))
+    
+    riskPerShare = sl - close
+    tp1 = close - (riskPerShare * tp1RR)
+    tp2 = close - (riskPerShare * tp2RR)
+    rr = (close - tp1) / riskPerShare
+    
+    entryPrice := close
+    stopLoss := sl
+    takeProfit1 := tp1
+    takeProfit2 := tp2
+    riskAmount := riskPerShare
+    calculatedRR := rr
+    
+    if rr >= minRR
+        strategy.entry("Short", strategy.short)
+        strategy.exit("TP1 Short", "Short", qty_percent=tp1Percent, limit=tp1, stop=sl)
+        strategy.exit("TP2 Short", "Short", limit=tp2, stop=sl)
+        
+        shortLabel := label.new(bar_index, high, text="SHORT", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.large)
+        label.new(bar_index, high + atr, text="Entry: " + str.tostring(close, "#.##") + "\nSL: " + str.tostring(sl, "#.##") + "\nTP1: " + str.tostring(tp1, "#.##") + "\nTP2: " + str.tostring(tp2, "#.##"), style=label.style_label_down, color=color.new(color.maroon, 20), textcolor=color.white, size=size.small)
+        
+        alert("SHORT SIGNAL - " + syminfo.tickerid + "\nEntry: " + str.tostring(close, "#.##") + "\nSL: " + str.tostring(sl, "#.##") + "\nTP1: " + str.tostring(tp1, "#.##") + " (1:" + str.tostring(tp1RR, "#.#") + " RR)" + "\nTP2: " + str.tostring(tp2, "#.##") + " (1:" + str.tostring(tp2RR, "#.#") + " RR)" + "\nRR: 1:" + str.tostring(rr, "#.##") + "\nTime: " + str.tostring(hour(time, "UTC"), "00") + ":" + str.tostring(minute(time, "UTC"), "00") + " UTC", alert.freq_once_per_bar_close)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLOTTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+plot(ema50, "EMA 50", color=color.new(color.blue, 0), linewidth=2)
+
+plotshape(longCondition and not newsBlocked and timeAllowed and calculatedRR >= minRR and strategy.position_size == 0, "Long Signal", shape.triangleup, location.belowbar, color.new(color.green, 0), size=size.normal)
+plotshape(shortCondition and not newsBlocked and timeAllowed and calculatedRR >= minRR and strategy.position_size == 0, "Short Signal", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.normal)
+
+plot(strategy.position_size > 0 ? stopLoss : na, "SL Long", color.red, 2, plot.style_linebr)
+plot(strategy.position_size > 0 ? takeProfit1 : na, "TP1 Long", color.green, 2, plot.style_linebr)
+plot(strategy.position_size > 0 ? takeProfit2 : na, "TP2 Long", color.lime, 2, plot.style_linebr)
+plot(strategy.position_size < 0 ? stopLoss : na, "SL Short", color.red, 2, plot.style_linebr)
+plot(strategy.position_size < 0 ? takeProfit1 : na, "TP1 Short", color.green, 2, plot.style_linebr)
+plot(strategy.position_size < 0 ? takeProfit2 : na, "TP2 Short", color.lime, 2, plot.style_linebr)
+
+bgcolor(newsBlocked ? color.new(color.orange, 90) : na, title="News Block")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATS TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table statsTable = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(statsTable, 0, 0, "STATS", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    table.cell(statsTable, 1, 0, "", bgcolor=color.new(color.blue, 60))
+    
+    wins = strategy.wintrades
+    losses = strategy.losstrades
+    total = wins + losses
+    winRate = total > 0 ? (wins / total) * 100 : 0
+    
+    table.cell(statsTable, 0, 1, "Total Trades", text_color=color.white, text_size=size.tiny)
+    table.cell(statsTable, 1, 1, str.tostring(total), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 2, "Win Rate", text_color=color.white, text_size=size.tiny)
+    table.cell(statsTable, 1, 2, str.tostring(winRate, "#.#") + "%", text_color=winRate >= 60 ? color.green : color.red, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 3, "Wins / Losses", text_color=color.white, text_size=size.tiny)
+    table.cell(statsTable, 1, 3, str.tostring(wins) + " / " + str.tostring(losses), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 4, "Net Profit", text_color=color.white, text_size=size.tiny)
+    table.cell(statsTable, 1, 4, str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.tiny)
+    
+    table.cell(statsTable, 0, 5, "Min RR", text_color=color.white, text_size=size.tiny)
+    table.cell(statsTable, 1, 5, "1:" + str.tostring(minRR, "#.#"), text_color=color.yellow, text_size=size.tiny)

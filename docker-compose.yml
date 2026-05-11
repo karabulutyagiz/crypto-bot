@@ -1,0 +1,15 @@
+name: crypto-bot-local
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crypto-bot-bot
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - ./trades.db:/app/trades.db
+    command: ["python", "main.py"]
